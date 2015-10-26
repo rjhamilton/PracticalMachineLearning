@@ -1,0 +1,204 @@
+---
+title: "Practical Machine Learning - Course Project"
+author: "Bob Hamilton"
+date: "Friday, October 23, 2015"
+output: html_document
+---
+
+```{r setup, cache=FALSE, echo=FALSE, message=FALSE, warning=FALSE, tidy=FALSE}
+## Requirements:
+#
+# 1) Predict the manner in which the subjects did the exercise. This is the "classe" 
+# variable in the trainCases set. You may use any of the other variables to 
+# predict with. 
+# 2) You should create a report describing how you built your model, 
+# 3) How you used cross validation, 
+# 4) What you think the expected out of sample error is, and
+# 5) Why you made the choices you did. 
+# 6) You will also use your prediction model to predict 20 different test 
+# cases. 
+# 
+## Resources:
+#
+# Random Forest, Leo Breiman:
+#   https://cran.r-project.org/web/packages/randomForest/randomForest.pdf
+#   https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm
+#
+# Caret package, Max Kuhn:
+#    https://cran.r-project.org/web/packages/caret/caret.pdf
+#	http://topepo.github.io/caret/trainCases.html
+#	http://topepo.github.io/caret/bytag.html
+#
+
+#rm(list=ls(all=TRUE))
+setwd("D:/WORK/MOOC-MachineLearning")
+
+## setup parallel processing
+library(doParallel)
+registerDoParallel()
+#getDoParWorkers()
+```
+
+## Overview
+The field of Human Activity Recognition (HAR) based on accelerometers worn by study participants has been made possible by the availability of inexpensive wearable devices such as Jawbone Up, Nike FuelBand, and Fitbit.  Predicting a participant's activity based on telemetry from such devices is a challenging machine learning problem.
+
+Six subjects were asked to perform 10 repetitions of dumbbell bicep curls in 5 different fashions:
+
+- correctly (class A), 
+- throwing elbows forward (class B),
+- lifting dumbbell only halfway (class C)
+- lowering dumbbell only halfway (class D), and
+- throwing hips forward (class E).
+    
+Class A corresponds to the correct way to do bicep curls while the other 4 classes corresponsd to common mistakes.  Telemetry was captured from wearable devices on the hips, arm, forearm, and the dumbbell itself.  From the telemetry is it possible to identify common mistakes?
+
+The goal of this course project is to create a machine learning-based HAR classifier to predict the activity of 20 different test cases provided by the course proctors.  Random Forests were used.
+
+The training dataset was generously made available by the authors of [*Qualitative Activity Recognition of Weight Lifting Exercises*](http://groupware.les.inf.puc-rio.br/har).
+
+## Dataset Preparation
+The authors of the training dataset extracted features from the raw telemetry using a sliding window approach.  Extracted features were presented as a time-series of snapshots through multiple bicep curls.  The beginning of each curl cycle was identified to synchronize repetitions for aggregation.  The authors went on to model [Euler angles](https://en.wikipedia.org/wiki/Euler_angles) between pairs of wearable sensors and, in doing so, were able to infer how many degrees the elbow and other skeletal joints were flexed. A time series of skeletal joint angles averaged over multiple repetitions sounds like an ideal dataset.
+
+But this feature-rich, time-series dataset is of no value because the test cases provided by the course proctors contain no clues as to what part of the curl cycle each test case was taken.  Accordingly, all columns related to time-series were dropped from the training dataset.
+
+Many columns had little to no data.  Only fully populated columns were kept.
+
+Exploratory data analysis showed that the data was non-linear:  a good candidate for tree-based classifiers.  No furthur processing of the data was done because transforming, centering and/or scaling cannot improve the accuracy of tree-based classifiers so long as the order of the data is not changed.
+
+The experimental setup allowed each subject to be his own control enabling customized models for each study participant.  As it turns out, initial tree models determined ```user_name``` was not important for node splitting.  Accordingly, the ```user_name``` column was dropped.  Moreover, a universal model that need not be trained for each new subject is more valuable.
+
+The ```trainCases``` and ```testCases``` datasets were given identical treatment.
+
+```{r dataprep, cache=TRUE, echo=TRUE, message=FALSE, warning=FALSE, tidy=FALSE}
+URL_TRAINCASES <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+URL_TESTCASES <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+## prep trainCases dataset
+df <- read.csv(URL_TRAINCASES, stringsAsFactors=FALSE, na.strings=c("", "NA", "#DIV/0!"))
+classe <- factor(df[,160])                  # save trainCases class identifier
+df <- df[, -c(1, 2, 3, 4, 5, 6, 7, 160)]    # drop columns we don't need
+ixDrop <- which(apply(df, 2, function(x){any(is.na(x))}))
+df <- df[, -ixDrop]				            # drop empty columns
+trainCases <- cbind(df, classe)			    # restore trainCases class identifier
+
+## prep testCases dataset
+df <- read.csv(URL_TESTCASES, stringsAsFactors=FALSE, na.strings=c("", "NA", "#DIV/0!"))
+problem_id <- df[,160]				        # save testCases identifier
+df <- df[, -c(1, 2, 3, 4, 5, 6, 7, 160)]	# drop the exact same columns here
+df <- df[, -ixDrop]                         #   and here
+testCases <- cbind(df, problem_id)		    # restore testCases identifier
+
+#str(trainCases)
+#str(testCases)
+#cbind(colnames(trainCases), colnames(testCases))
+```
+
+## Separate Holdout Test Set?
+Leo Breiman, the creator of Random Forests, said "there is no need for cross-validation or a separate test set to get an unbiased estimate of the test set error.  [It is estimated internally, during the run, as follows...](https://www.stat.berkeley.edu/~breiman/RandomForests/cc_home.htm#ooberr)" 
+
+In spite of this, when there is an abundant number of cases, defensive programming calls for a separate test set to protect oneself from a host of possible mistakes.  The separate test set is used once to demonstrate the final model's ability to generalize, without overfitting, to previously unseen cases.
+
+Taking Mssr. Breiman's advice, out-of-bag validations were relied on as a substitute for cross validation testing.
+
+The caret library's createDataPartition() function split the ```trainCases``` dataset into 2 partitions: ```train``` and ```test```.  Stratified sampling preserved class distributions within the splits.  75% of the cases were spent on training and tuning the model; the remaining 25% were spent on a single final test.
+
+```{r holdout, cache=FALSE, echo=TRUE, message=FALSE, warning=FALSE, tidy=FALSE}
+library(caret)
+SEED <- 47
+PCT_TRAIN <- 0.75
+set.seed(SEED)
+ix <- createDataPartition(trainCases$classe, p=PCT_TRAIN, list=FALSE)
+train <- trainCases[ix,]
+test <- trainCases[-ix,]
+#nrow(train) + nrow(test) == nrow(trainCases) # audit
+```
+
+## Run Random Forest Model
+A Random Forest with 100 trees was grown.  All 52 features were used.  The caret package's train() function tuned the Random Forest by flexing [tunable parameter ```mtry```](https://www.stat.berkeley.edu/~breiman/RandomForests/cc_manual.htm#l2) which specifies the number of variables randomly sampled as candidates at each split of the tree.  The best value of ```mtry``` is given by the model with the highest out-of-bag accuracy.  The final model was run using this value.  
+
+```{r runModel, cache=FALSE, echo=TRUE, message=FALSE, warning=FALSE, tidy=FALSE}
+nFeat <- ncol(train) - 1
+mdlStr <- "classe~."
+mdl <- train(as.formula(mdlStr), data=train, 
+    method="rf", ntree=100,
+    trControl=trainControl(method="oob"), tuneLength=5,
+    keep.forest=TRUE, importance=FALSE,
+    verbose=FALSE
+)
+mdl
+
+## out-of-bag error rate
+nClass <- length(mdl$finalModel$classes)
+cm <- mdl$finalModel$confusion[,1:nClass]
+oobError <- 1 - sum(cm * diag(nClass)) / sum(cm)
+
+## holdout test set error rate
+pred <- predict(mdl$finalModel, newdata=test)
+testError <- 1 - sum(pred == test$classe) / length(test$classe)
+
+cat(sprintf("nFeat = %d\nmdlStr = %s\nbest mtry = %d\nout-of-bag error = %3.3f%%\ntest set error = %3.3f%%\n",
+    nFeat, mdlStr, mdl$bestTune$mtry, oobError * 100, testError * 100))
+```
+
+## Feature Pruning
+Are all 52 features important?  The model was re-run with the 26 most important features.  How did this affect the error rate on the holdout test set?
+
+```{r rerunModel, cache=FALSE, echo=TRUE, message=FALSE, warning=FALSE, tidy=FALSE}
+fi <- mdl$finalModel$importance
+featNames <- rownames(fi)[order(fi, decreasing=TRUE)]
+nFeat <- length(fi) %/% 2
+mdlStr <- "classe"
+for (i in 1:nFeat) mdlStr <- paste0(mdlStr, ifelse(i == 1, "~", "+"), featNames[i])
+
+mdl <- train(as.formula(mdlStr), data=train, 
+    method="rf", ntree=100,
+    trControl=trainControl(method="oob"), tuneLength=5,
+    keep.forest=TRUE, importance=FALSE,
+    verbose=FALSE
+)
+#mdl
+
+## out-of-bag error rate
+nClass <- length(mdl$finalModel$classes)
+cm <- mdl$finalModel$confusion[,1:nClass]
+oobError <- 1 - sum(cm * diag(nClass)) / sum(cm)
+
+## holdout test set error rate
+pred <- predict(mdl$finalModel, newdata=test)
+testError <- 1 - sum(pred == test$classe) / length(test$classe)
+
+cat(sprintf("nFeat = %d\nmdlStr = %s\nbest mtry = %d\nout-of-bag error = %3.3f%%\ntest set error = %3.3f%%\n",
+    nFeat, mdlStr, mdl$bestTune$mtry, oobError * 100, testError * 100))
+```
+
+Halfing the number of features available for node splitting had a small effect on the model's error rate.  Indeed on some runs the model's error rate actually *decreased*.  This suggests that further pruning would continue to increase model efficiency with no sacrifice in accuracy.
+
+## Test Case Predictions
+Here are the predicted activities for the 20 test cases provided by course proctors. 
+
+```{r testCasePredictions, cache=FALSE, echo=TRUE, message=FALSE, warning=FALSE, tidy=FALSE}
+pred <- predict(mdl, newdata=testCases)
+activityDescr <- c("correctly", "throwing elbows forward", 
+    "lifting dumbbell only halfway", "lowering dumbbell only halfway", 
+    "throwing hips forward")
+data.frame(
+    problem_id=testCases$problem_id, 
+    pred=pred,
+	activityDescr=activityDescr[as.integer(pred)],
+	stringsAsFactors=FALSE
+)
+```
+
+
+```{r testCaseAnswers, cache=FALSE, echo=FALSE, message=FALSE, warning=FALSE, tidy=FALSE}
+## format test case answers for submission, one file per case
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(as.character(pred))
+```
